@@ -9,6 +9,7 @@ from .config import settings
 from .database import SessionLocal, get_session, initialize_database
 from .models import Announcement, Employee
 from .schemas import AnnouncementCreate, AnnouncementOut, EmployeeCreate, EmployeeOut
+from .auth import CurrentUser, get_current_user, require_roles
 
 async def seed() -> None:
     async with SessionLocal() as session:
@@ -63,31 +64,74 @@ app.add_middleware(
 
 @app.get("/api/directory/health")
 async def health():
-    return {"service": "employee-directory-api", "status": "healthy"}
-
-@app.get("/api/directory/employees", response_model=list[EmployeeOut])
-async def list_employees(session: AsyncSession = Depends(get_session)):
-    result = await session.scalars(select(Employee).order_by(Employee.id))
+    return {
+        "service": "employee-directory-api",
+        "status": "healthy",
+    }
+@app.get(
+    "/api/directory/employees",
+    response_model=list[EmployeeOut],
+)
+async def list_employees(
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(get_current_user),
+):
+    result = await session.scalars(
+        select(Employee).order_by(Employee.id)
+    )
     return list(result)
 
-@app.get("/api/directory/employees/{employee_id}", response_model=EmployeeOut)
-async def get_employee(employee_id: int, session: AsyncSession = Depends(get_session)):
+@app.get(
+    "/api/directory/employees/{employee_id}",
+    response_model=EmployeeOut,
+)
+async def get_employee(
+    employee_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(get_current_user),
+):
     employee = await session.get(Employee, employee_id)
+
     if employee is None:
-        raise HTTPException(status_code=404, detail="Employee not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found",
+        )
+
     return employee
 
-@app.post("/api/directory/employees", response_model=EmployeeOut, status_code=status.HTTP_201_CREATED)
-async def create_employee(payload: EmployeeCreate, session: AsyncSession = Depends(get_session)):
+@app.post(
+    "/api/directory/employees",
+    response_model=EmployeeOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_employee(
+    payload: EmployeeCreate,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_roles("ADMIN")),
+):
     employee = Employee(**payload.model_dump())
+
     session.add(employee)
+
     await session.commit()
     await session.refresh(employee)
+
     return employee
 
-@app.get("/api/directory/announcements", response_model=list[AnnouncementOut])
-async def list_announcements(session: AsyncSession = Depends(get_session)):
-    result = await session.scalars(select(Announcement).order_by(Announcement.created_at.desc()))
+@app.get(
+    "/api/directory/announcements",
+    response_model=list[AnnouncementOut],
+)
+async def list_announcements(
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(get_current_user),
+):
+    result = await session.scalars(
+        select(Announcement)
+        .order_by(Announcement.created_at.desc())
+    )
+
     return list(result)
 
 @app.post("/api/directory/internal/announcements", response_model=AnnouncementOut)
