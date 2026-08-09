@@ -15,23 +15,41 @@ env:
   CONTAINER_NAME: employee-directory-api
   ECR_REPOSITORY: employee-directory-api
 
+# Prevent two deployments of this service from running at the same time
+concurrency:
+  group: employee-directory-dev-deploy
+  cancel-in-progress: false
+
 jobs:
   test-build-deploy:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+
     steps:
+      # -----------------------------------------------------
+      # 1. Checkout source code
+      # -----------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
+      # -----------------------------------------------------
+      # 2. Setup Python
+      # -----------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
 
+      # -----------------------------------------------------
+      # 3. Install dependencies
+      # -----------------------------------------------------
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # -----------------------------------------------------
+      # 4. Run tests
+      # -----------------------------------------------------
       - name: Run tests
         env:
           SKIP_DB_INIT: "true"
@@ -39,42 +57,112 @@ jobs:
           COGNITO_USER_POOL_CLIENT_ID: "test-client"
         run: python -m pytest -q
 
+      # -----------------------------------------------------
+      # 5. Authenticate GitHub -> AWS using OIDC
+      # -----------------------------------------------------
       - name: Configure AWS credentials with GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # -----------------------------------------------------
+      # 6. Login to ECR
+      # -----------------------------------------------------
       - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push immutable image
-        id: image
+      # -----------------------------------------------------
+      # 7. Check whether this commit image already exists
+      # -----------------------------------------------------
+      - name: Check image in ECR
+        id: image-check
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           IMAGE_URI="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          docker build -t "$IMAGE_URI" .
-          docker push "$IMAGE_URI"
+
+          echo "Checking ECR for:"
+          echo "$IMAGE_URI"
+
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            > /dev/null 2>&1
+          then
+            echo "Image already exists in ECR."
+            echo "Skipping Docker build and push."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image does not exist."
+            echo "Docker image will be built and pushed."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
           echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
 
+      # -----------------------------------------------------
+      # 8. Build and push ONLY if image does not exist
+      # -----------------------------------------------------
+      - name: Build and push immutable image
+        if: steps.image-check.outputs.exists == 'false'
+        env:
+          IMAGE_URI: ${{ steps.image-check.outputs.uri }}
+        run: |
+          echo "Building image:"
+          echo "$IMAGE_URI"
+
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+      # -----------------------------------------------------
+      # 9. Reuse image if already available
+      # -----------------------------------------------------
+      - name: Display deployment image
+        env:
+          IMAGE_URI: ${{ steps.image-check.outputs.uri }}
+          IMAGE_EXISTS: ${{ steps.image-check.outputs.exists }}
+        run: |
+          if [ "$IMAGE_EXISTS" = "true" ]; then
+            echo "Reusing existing ECR image:"
+          else
+            echo "Using newly built ECR image:"
+          fi
+
+          echo "$IMAGE_URI"
+
+      # -----------------------------------------------------
+      # 10. Download current ECS task definition
+      # -----------------------------------------------------
       - name: Download current task definition
         run: |
           aws ecs describe-task-definition \
             --task-definition "$TASK_FAMILY" \
-            --query taskDefinition > task-definition.json
+            --query taskDefinition \
+            > task-definition.json
 
+      # -----------------------------------------------------
+      # 11. Create next task-definition revision
+      # -----------------------------------------------------
       - name: Create next task-definition revision
         env:
-          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          IMAGE_URI: ${{ steps.image-check.outputs.uri }}
         run: |
           jq \
             --arg IMAGE "$IMAGE_URI" \
             --arg NAME "$CONTAINER_NAME" \
             '(.containerDefinitions[] | select(.name == $NAME).image) = $IMAGE
-             | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+             | del(
+                 .taskDefinitionArn,
+                 .revision,
+                 .status,
+                 .requiresAttributes,
+                 .compatibilities,
+                 .registeredAt,
+                 .registeredBy
+               )' \
             task-definition.json > task-definition-new.json
 
           TASK_ARN=$(aws ecs register-task-definition \
@@ -84,6 +172,12 @@ jobs:
 
           echo "TASK_ARN=$TASK_ARN" >> "$GITHUB_ENV"
 
+          echo "Registered task definition:"
+          echo "$TASK_ARN"
+
+      # -----------------------------------------------------
+      # 12. Deploy new task definition
+      # -----------------------------------------------------
       - name: Deploy ECS service
         run: |
           aws ecs update-service \
@@ -93,6 +187,10 @@ jobs:
             --desired-count 1 \
             --force-new-deployment
 
+          echo "Waiting for ECS service to stabilize..."
+
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE"
+
+          echo "Deployment completed successfully."
